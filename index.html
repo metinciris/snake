@@ -1,0 +1,343 @@
+<script type="text/javascript">
+        var gk_isXlsx = false;
+        var gk_xlsxFileLookup = {};
+        var gk_fileData = {};
+        function filledCell(cell) {
+          return cell !== '' && cell != null;
+        }
+        function loadFileData(filename) {
+        if (gk_isXlsx && gk_xlsxFileLookup[filename]) {
+            try {
+                var workbook = XLSX.read(gk_fileData[filename], { type: 'base64' });
+                var firstSheetName = workbook.SheetNames[0];
+                var worksheet = workbook.Sheets[firstSheetName];
+
+                // Convert sheet to JSON to filter blank rows
+                var jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1, blankrows: false, defval: '' });
+                // Filter out blank rows (rows where all cells are empty, null, or undefined)
+                var filteredData = jsonData.filter(row => row.some(filledCell));
+
+                // Heuristic to find the header row by ignoring rows with fewer filled cells than the next row
+                var headerRowIndex = filteredData.findIndex((row, index) =>
+                  row.filter(filledCell).length >= filteredData[index + 1]?.filter(filledCell).length
+                );
+                // Fallback
+                if (headerRowIndex === -1 || headerRowIndex > 25) {
+                  headerRowIndex = 0;
+                }
+
+                // Convert filtered JSON back to CSV
+                var csv = XLSX.utils.aoa_to_sheet(filteredData.slice(headerRowIndex)); // Create a new sheet from filtered array of arrays
+                csv = XLSX.utils.sheet_to_csv(csv, { header: 1 });
+                return csv;
+            } catch (e) {
+                console.error(e);
+                return "";
+            }
+        }
+        return gk_fileData[filename] || "";
+        }
+        </script><!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Snake Game</title>
+    <style>
+        body { margin: 0; display: flex; justify-content: center; align-items: center; height: 100vh; background: #000; }
+        canvas { border: 1px solid #333; }
+    </style>
+</head>
+<body>
+    <canvas id="gameCanvas" width="800" height="600"></canvas>
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        // Game settings
+        const WIDTH = 800;
+        const HEIGHT = 600;
+        const BLOCK_SIZE = Math.min(WIDTH, HEIGHT) / 40;
+        const SNAKE_WIDTH = BLOCK_SIZE * 0.8;
+        const FPS = 30;
+        const GRID_WIDTH = Math.floor(WIDTH / BLOCK_SIZE);
+        const GRID_HEIGHT = Math.floor(HEIGHT / BLOCK_SIZE);
+
+        // Colors
+        const BLACK = '#000000';
+        const WHITE = '#FFFFFF';
+        const GREEN = '#00FF00';
+        const RED = '#FF0000';
+        const GRAY = '#646464';
+
+        // Directions
+        const UP = [0, -1];
+        const DOWN = [0, 1];
+        const LEFT = [-1, 0];
+        const RIGHT = [1, 0];
+
+        // Game state
+        let snake = [[Math.floor(GRID_WIDTH / 2), Math.floor(GRID_HEIGHT / 2)]];
+        let direction = RIGHT;
+        let food = [Math.floor(Math.random() * GRID_WIDTH), Math.floor(Math.random() * GRID_HEIGHT)];
+        let score = 0;
+        let running = true;
+
+        // AI functions
+        function manhattan(p1, p2) {
+            return Math.abs(p1[0] - p2[0]) + Math.abs(p1[1] - p2[1]);
+        }
+
+        function aStar(snake, target, ignoreTail = false) {
+            const head = snake[0];
+            const pq = [[0 + manhattan(head, target), 0, head, []]];
+            const visited = new Set();
+            const snakeSet = new Set(snake.map(s => `${s[0]},${s[1]}`));
+            if (ignoreTail) snakeSet.delete(`${snake[snake.length - 1][0]},${snake[snake.length - 1][1]}`);
+            visited.add(`${head[0]},${head[1]}`);
+
+            while (pq.length) {
+                pq.sort((a, b) => a[0] - b[0]);
+                const [f, g, pos, path] = pq.shift();
+                if (pos[0] === target[0] && pos[1] === target[1]) return path;
+
+                for (const d of [UP, RIGHT, DOWN, LEFT]) {
+                    const nx = pos[0] + d[0];
+                    const ny = pos[1] + d[1];
+                    const key = `${nx},${ny}`;
+                    if (nx >= 0 && nx < GRID_WIDTH && ny >= 0 && ny < GRID_HEIGHT && !visited.has(key)) {
+                        visited.add(key);
+                        const newPath = [...path, d];
+                        const newG = g + 1;
+                        const h = manhattan([nx, ny], target);
+                        pq.push([newG + h, newG, [nx, ny], newPath]);
+                    }
+                }
+            }
+            return null;
+        }
+
+        function bfs(snake, target, ignoreTail = false) {
+            const head = snake[0];
+            const queue = [[head, []]];
+            const visited = new Set();
+            const snakeSet = new Set(snake.map(s => `${s[0]},${s[1]}`));
+            if (ignoreTail) snakeSet.delete(`${snake[snake.length - 1][0]},${snake[snake.length - 1][1]}`);
+            visited.add(`${head[0]},${head[1]}`);
+
+            while (queue.length) {
+                const [pos, path] = queue.shift();
+                if (pos[0] === target[0] && pos[1] === target[1]) return path;
+
+                for (const d of [UP, RIGHT, DOWN, LEFT]) {
+                    const nx = pos[0] + d[0];
+                    const ny = pos[1] + d[1];
+                    const key = `${nx},${ny}`;
+                    if (nx >= 0 && nx < GRID_WIDTH && ny >= 0 && ny < GRID_HEIGHT && !visited.has(key)) {
+                        visited.add(key);
+                        queue.push([[nx, ny], [...path, d]]);
+                    }
+                }
+            }
+            return null;
+        }
+
+        function floodFill(snake, start) {
+            const obstacles = new Set(snake.slice(1).map(s => `${s[0]},${s[1]}`));
+            const visited = new Set(obstacles);
+            const queue = [];
+            let count = 0;
+
+            for (const d of [UP, DOWN, LEFT, RIGHT]) {
+                const nx = start[0] + d[0];
+                const ny = start[1] + d[1];
+                const key = `${nx},${ny}`;
+                if (nx >= 0 && nx < GRID_WIDTH && ny >= 0 && ny < GRID_HEIGHT && !visited.has(key)) {
+                    visited.add(key);
+                    queue.push([nx, ny]);
+                    count++;
+                }
+            }
+
+            while (queue.length) {
+                const pos = queue.shift();
+                for (const d of [UP, DOWN, LEFT, RIGHT]) {
+                    const nx = pos[0] + d[0];
+                    const ny = pos[1] + d[1];
+                    const key = `${nx},${ny}`;
+                    if (nx >= 0 && nx < GRID_WIDTH && ny >= 0 && ny < GRID_HEIGHT && !visited.has(key)) {
+                        visited.add(key);
+                        queue.push([nx, ny]);
+                        count++;
+                    }
+                }
+            }
+            return count;
+        }
+
+        function findPath(snake, food) {
+            const head = snake[0];
+            const directions = [UP, DOWN, LEFT, RIGHT];
+            const safeMovesToFood = [];
+            const safeMoves = [];
+
+            for (const d of directions) {
+                const nx = head[0] + d[0];
+                const ny = head[1] + d[1];
+                if (!(nx >= 0 && nx < GRID_WIDTH && ny >= 0 && ny < GRID_HEIGHT && !snake.some(s => s[0] === nx && s[1] === ny))) {
+                    continue;
+                }
+
+                if (nx === food[0] && ny === food[1]) {
+                    const simSnake = [...snake, [nx, ny]];
+                    const area = floodFill(simSnake, [nx, ny]);
+                    const tail = simSnake[simSnake.length - 1];
+                    const pathToTail = bfs(simSnake, tail, true);
+                    if (pathToTail !== null) {
+                        safeMovesToFood.push([1, -area, d]);
+                    }
+                } else {
+                    const simSnake = [[nx, ny], ...snake.slice(0, -1)];
+                    const area = floodFill(simSnake, [nx, ny]);
+                    const pathToFood = aStar(simSnake, food);
+                    if (pathToFood !== null) {
+                        let foodSimSnake = [...simSnake];
+                        for (const move of pathToFood.slice(0, -1)) {
+                            const fHead = foodSimSnake[0];
+                            foodSimSnake = [[fHead[0] + move[0], fHead[1] + move[1]], ...foodSimSnake.slice(0, -1)];
+                        }
+                        const fHead = foodSimSnake[0];
+                        foodSimSnake = [[fHead[0] + pathToFood[pathToFood.length - 1][0], fHead[1] + pathToFood[pathToFood.length - 1][1]], ...foodSimSnake];
+                        const tail = foodSimSnake[foodSimSnake.length - 1];
+                        const pathToTail = bfs(foodSimSnake, tail, true);
+                        if (pathToTail !== null) {
+                            safeMovesToFood.push([pathToFood.length + 1, -area, d]);
+                        }
+                    }
+                    safeMoves.push([-area, d]);
+                }
+            }
+
+            if (safeMovesToFood.length) {
+                safeMovesToFood.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+                return safeMovesToFood[0][2];
+            }
+
+            if (safeMoves.length) {
+                safeMoves.sort((a, b) => a[0] - b[0]);
+                return safeMoves[0][1];
+            }
+
+            for (const d of directions) {
+                const nx = head[0] + d[0];
+                const ny = head[1] + d[1];
+                if (nx >= 0 && nx < GRID_WIDTH && ny >= 0 && ny < GRID_HEIGHT && !snake.some(s => s[0] === nx && s[1] === ny)) {
+                    return d;
+                }
+            }
+
+            return null;
+        }
+
+        // Drawing functions
+        function drawText(text, size, color, x, y, alpha = 1) {
+            ctx.font = `${size}px Arial`;
+            ctx.fillStyle = color;
+            ctx.globalAlpha = alpha;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(text, x, y);
+            ctx.globalAlpha = 1;
+        }
+
+        // Game loop
+        function gameLoop() {
+            if (!running) {
+                drawText("Oyun Bitti", 50, RED, WIDTH / 2, HEIGHT / 4);
+                drawText(`Skor: ${score}`, 40, WHITE, WIDTH / 2, HEIGHT / 2);
+                return;
+            }
+
+            // Update
+            const nextDir = findPath(snake, food);
+            if (nextDir) direction = nextDir;
+
+            const head = snake[0];
+            const newHead = [head[0] + direction[0], head[1] + direction[1]];
+
+            if (newHead[0] < 0 || newHead[0] >= GRID_WIDTH || newHead[1] < 0 || newHead[1] >= GRID_HEIGHT || snake.some(s => s[0] === newHead[0] && s[1] === newHead[1])) {
+                running = false;
+                setTimeout(gameLoop, 2000);
+                return;
+            }
+
+            snake.unshift(newHead);
+
+            if (newHead[0] === food[0] && newHead[1] === food[1]) {
+                score++;
+                food = [Math.floor(Math.random() * GRID_WIDTH), Math.floor(Math.random() * GRID_HEIGHT)];
+                while (snake.some(s => s[0] === food[0] && s[1] === food[1])) {
+                    food = [Math.floor(Math.random() * GRID_WIDTH), Math.floor(Math.random() * GRID_HEIGHT)];
+                }
+            } else {
+                snake.pop();
+            }
+
+            // Draw
+            ctx.fillStyle = BLACK;
+            ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+            const points = snake.map(s => [s[0] * BLOCK_SIZE + BLOCK_SIZE / 2, s[1] * BLOCK_SIZE + BLOCK_SIZE / 2]);
+
+            for (let i = 0; i < points.length - 1; i++) {
+                if (i >= snake.length - 10) {
+                    const fadeFactor = (snake.length - i - 1) / 10;
+                    const greenValue = Math.floor(150 + 105 * fadeFactor);
+                    ctx.strokeStyle = `rgb(0, ${greenValue}, 0)`;
+                } else {
+                    ctx.strokeStyle = GREEN;
+                }
+                ctx.lineWidth = SNAKE_WIDTH;
+                ctx.lineCap = 'round';
+                ctx.beginPath();
+                ctx.moveTo(points[i][0], points[i][1]);
+                ctx.lineTo(points[i + 1][0], points[i + 1][1]);
+                ctx.stroke();
+            }
+
+            for (let i = 0; i < points.length; i++) {
+                if (i === 0) {
+                    ctx.fillStyle = GREEN;
+                } else if (i >= snake.length - 10) {
+                    const fadeFactor = (snake.length - i) / 10;
+                    const greenValue = Math.floor(150 + 105 * fadeFactor);
+                    ctx.fillStyle = `rgb(0, ${greenValue}, 0)`;
+                } else {
+                    ctx.fillStyle = GREEN;
+                }
+                ctx.beginPath();
+                ctx.arc(points[i][0], points[i][1], SNAKE_WIDTH / 2, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            ctx.fillStyle = RED;
+            ctx.beginPath();
+            ctx.arc(food[0] * BLOCK_SIZE + BLOCK_SIZE / 2, food[1] * BLOCK_SIZE + BLOCK_SIZE / 2, BLOCK_SIZE / 2, 0, Math.PI * 2);
+            ctx.fill();
+
+            drawText(`Skor: ${score}`, 30, WHITE, WIDTH / 2, 20);
+
+            setTimeout(gameLoop, 1000 / FPS);
+        }
+
+        // Event listeners
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                running = false;
+            }
+        });
+
+        // Start game
+        gameLoop();
+    </script>
+</body>
+</html>
