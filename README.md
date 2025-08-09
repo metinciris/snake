@@ -1,7 +1,7 @@
 Snake Game
 
 Otomatik ekran koruması şeklinde çalışan yılan oyunu.
-Yeni versiyonlar eklenmektedir. 
+Yeni versiyonlar eklenmektedir. Snake_2.py Grok 4 Heavy modeli.
 
 Python
 
