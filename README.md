@@ -1,6 +1,8 @@
 Snake Game
 
 Otomatik ekran koruması şeklinde çalışan yılan oyunu.
+Yeni versiyonlar eklenmektedir. 
+
 Python
 
 A modern take on the classic Snake game, featuring an intelligent AI, smooth visuals, and high score tracking. The snake moves as a continuous, tube-like structure with rounded joints and a gradually fading tail, designed to avoid traps and maximize survival.
