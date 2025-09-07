@@ -1,12 +1,12 @@
 
 """
-Snake Screensaver — Smarter AI v2 (Anti-oscillation + Safer Food)
-------------------------------------------------------------------
-- Köşe/duvarlarda yukarı-aşağı veya sağa-sola **osilasyon**u engelleyen sezgiler.
-- Geriye dönüş (immediate reverse) zorunlu olmadıkça **yasak**.
-- Yiyecek yerleştirirken **ulaşılabilirlik (A*)** şartı arar.
-- MAX_ASTAR_STEPS yükseltildi, büyük tahtada yol bulma artar.
-- Hafif duvar uzaklığı tercihi: stuck olduğunda duvardan **uzaklaşmayı** tercih eder.
+Snake Screensaver — Smart v3
+----------------------------
+- **Köşe osilasyonu KESİN çözüm**: Corner-escape modu (min_wall_dist<=1 ise duvardan uzaklaştıran hamle zorlanır).
+- **Tersine dönme (reverse) yasak** mecbur kalınmadıkça.
+- **Osilasyon cooldown**: ABAB saptanınca aynı eksene 0.7s boyunca ağır ceza.
+- **Skorlu aday seçimi**: food yakınlığı + boş alan + kuyruk erişimi + duvardan uzaklık + yön ataleti.
+- **Food timeout dinamik**: tahta boyu ve hızla orantılı; default 30s yerine 60–150s aralığı.
 """
 
 import sys
@@ -22,7 +22,7 @@ import pygame
 DEBUG = False
 
 # Ekran & çizim
-RENDER_FPS = 60          # Çizim FPS
+RENDER_FPS = 60
 PRETTY_SNAKE = True
 
 # Hareket zamanlaması (oyun mantığı)
@@ -31,9 +31,12 @@ MOVE_SPEEDUP_PER_SCORE = 0.0008
 MOVE_MIN_INTERVAL = 0.020
 
 # Pathfinding / Güvenlik
-MAX_ASTAR_STEPS = 500
-SAFETY_BASE = 0.40
-SAFETY_MAX = 0.85
+MAX_ASTAR_STEPS = 600
+SAFETY_BASE = 0.42
+SAFETY_MAX = 0.88
+
+# Osilasyon parametreleri
+OSC_COOLDOWN_SEC = 0.7
 
 # Renkler
 BLACK  = (0, 0, 0)
@@ -146,13 +149,15 @@ def a_star(head, target, blocked_set, w, h, ignore_tail_cell=None, max_steps=MAX
             if ng < g.get(np, 1e12):
                 g[np] = ng
                 came_from[np] = (pos, d)
-                edge_penalty = 0.15 if (nx == 0 or ny == 0 or nx == w - 1 or ny == h - 1) else 0.0
-                f = ng + manhattan(np, target) + edge_penalty
+                # Kenar cezası ve köşe cezası
+                edge_penalty = 0.25 if (nx == 0 or ny == 0 or nx == w - 1 or ny == h - 1) else 0.0
+                corner_pen  = 0.25 if ((nx in (0, w-1)) and (ny in (0, h-1))) else 0.0
+                f = ng + manhattan(np, target) + edge_penalty + corner_pen
                 heapq.heappush(openq, (f, ng, np))
         steps += 1
     return None
 
-def is_reachable(start, goal, blocked_set, w, h, ignore_cell=None, max_expansions=2000):
+def is_reachable(start, goal, blocked_set, w, h, ignore_cell=None, max_expansions=2500):
     if start == goal:
         return True
     blocked = set(blocked_set)
@@ -198,35 +203,39 @@ def flood_fill_limited(start, blocked_set, w, h, limit):
                     q.append(np)
     return cnt
 
+def min_wall_dist(p, w, h):
+    x, y = p
+    return min(x, y, w - 1 - x, h - 1 - y)
+
 # ----------------------- Food yerleştirme -----------------------
 def place_food(snake, snake_set, w, h):
     head = snake[0]
     tail = snake[-1]
-    # İçeriden örnekle
-    min_x, min_y = 1, 1
-    max_x, max_y = w - 2, h - 2
 
+    # Dinamik hedef: head'in 10..60 adım ilerisindeki bölgeye odaklan (izlemeyi zevkli kılar)
+    window = max(10, (w*h)//120)  # tahta büyüdükçe artır
     candidates = []
     tries = 0
-    while len(candidates) < 36 and tries < 200:
+    while len(candidates) < 50 and tries < 400:
         tries += 1
-        fx = random.randint(min_x, max_x)
-        fy = random.randint(min_y, max_y)
+        fx = random.randint(1, w - 2)
+        fy = random.randint(1, h - 2)
         p = (fx, fy)
         if p in snake_set:
             continue
-        candidates.append(p)
+        # uzaklık ve duvardan uzaklık puanı
+        dist = manhattan(head, p)
+        wall = min_wall_dist(p, w, h)
+        candidates.append((-(wall) + random.random()*0.1, dist, p))
+    # duvardan uzak olanları öne al, sonra mesafe
+    candidates.sort()
 
-    # Uzaklıkça sırala, önce uzaklar
-    candidates.sort(key=lambda p: manhattan(p, head), reverse=True)
     blocked = snake_set
-
-    # Ulaşılabilir ilk adayı seç (kuyruğu serbest say)
-    for p in candidates:
+    for _, _, p in candidates:
         if a_star(head, p, blocked, w, h, ignore_tail_cell=tail) is not None:
             return p
 
-    # Fallback — garantili rastgele boş yer
+    # Fallback
     while True:
         p = (random.randint(0, w - 1), random.randint(0, h - 1))
         if p not in snake_set:
@@ -239,43 +248,33 @@ class PlannerState:
         self.kind = None
         self.for_food = None
         self.invalidations = 0
-        self.last_heads = deque(maxlen=6)
+        self.last_heads = deque(maxlen=8)
         self.last_dir = None
-        self.osc_count = 0
-        self.last_axis = None  # 'h' or 'v'
+        self.osc_axis = None   # 'h' or 'v'
+        self.osc_until = 0.0   # time threshold
 
-def detect_oscillation(state):
-    # 2-adımlı osilasyon (ABAB) kontrolü
+def detect_oscillation(state, now):
     if len(state.last_heads) >= 4:
         a1 = state.last_heads[-1]
         a2 = state.last_heads[-2]
         a3 = state.last_heads[-3]
         a4 = state.last_heads[-4]
         if a1 == a3 and a2 == a4:
-            state.osc_count += 1
-            # Hangi eksende?
-            if a1[0] == a2[0]:
-                state.last_axis = 'v'  # dikey gidip gelme
-            elif a1[1] == a2[1]:
-                state.last_axis = 'h'  # yatay gidip gelme
+            # eksen bul
+            axis = 'v' if a1[0] == a2[0] else 'h'
+            state.osc_axis = axis
+            state.osc_until = now + OSC_COOLDOWN_SEC
             return True
-    # değilse sıfırla
-    state.osc_count = 0
-    state.last_axis = None
     return False
 
-def min_wall_dist(p, w, h):
-    x, y = p
-    return min(x, y, w - 1 - x, h - 1 - y)
-
-def pick_move(snake, snake_set, food, w, h, state):
+def pick_move(snake, snake_set, food, w, h, state, now):
     head = snake[0]
     tail = snake[-1]
     length = len(snake)
     score = length - 1
     total_cells = w * h
 
-    # 1) Plan uygunsa devam
+    # Plan uygunsa uygula
     if state.path:
         d = state.path[0]
         nx, ny = head[0] + d[0], head[1] + d[1]
@@ -287,11 +286,9 @@ def pick_move(snake, snake_set, food, w, h, state):
             state.last_dir = d
             return d, (state.kind == 'food')
         else:
-            state.path.clear()
-            state.kind = None
-            state.invalidations += 1
+            state.path.clear(); state.kind = None; state.invalidations += 1
 
-    # 2) Yiyeceğe plan
+    # Yiyeceğe A* planı
     blocked = set(snake_set); blocked.discard(head)
     path_to_food = a_star(head, food, blocked, w, h, ignore_tail_cell=tail, max_steps=MAX_ASTAR_STEPS)
     if path_to_food:
@@ -299,23 +296,18 @@ def pick_move(snake, snake_set, food, w, h, state):
         nx, ny = head[0] + first[0], head[1] + first[1]
         new_head = (nx, ny)
         eating = (new_head == food)
-        blocked_future = set(snake_set)
-        blocked_future.add(new_head)
-        if not eating:
-            blocked_future.discard(tail)
+        blocked_future = set(snake_set); blocked_future.add(new_head)
+        if not eating: blocked_future.discard(tail)
         total_empty_future = total_cells - (len(snake) + (1 if eating else 0))
         min_safe = max(1, int(math.ceil(total_empty_future * safety_threshold(score))))
         area = flood_fill_limited(new_head, blocked_future, w, h, limit=min_safe)
-        tail_reach = is_reachable(new_head, tail, blocked_future, w, h, ignore_cell=None, max_expansions=2200)
+        tail_reach = is_reachable(new_head, tail, blocked_future, w, h, ignore_cell=None, max_expansions=2600)
         if area >= min_safe and tail_reach:
-            state.path = deque(path_to_food)
-            state.kind = 'food'
-            state.for_food = food
-            state.path.popleft()
-            state.last_dir = first
+            state.path = deque(path_to_food); state.kind = 'food'; state.for_food = food
+            state.path.popleft(); state.last_dir = first
             return first, True
 
-    # 3) Yerel güvenli hamleler (geri dönüşü tercih etme)
+    # Yerel adaylar — reverse yasak (mecbur kalmadıkça)
     prev_dir = None
     if len(snake) > 1:
         prev_dir = (head[0] - snake[1][0], head[1] - snake[1][1])
@@ -340,48 +332,53 @@ def pick_move(snake, snake_set, food, w, h, state):
         total_empty_future = w * h - (len(snake) + (1 if eating else 0))
         min_safe = max(1, int(math.ceil(total_empty_future * safety_threshold(score))))
         area = flood_fill_limited(new_head, blocked_future, w, h, limit=min_safe)
-        tail_reach = is_reachable(new_head, tail, blocked_future, w, h, ignore_cell=None, max_expansions=1400)
+        tail_reach = is_reachable(new_head, tail, blocked_future, w, h, ignore_cell=None, max_expansions=1600)
 
         if tail_reach and area >= min_safe:
             food_dist = manhattan(new_head, food)
-            wall_score = -min_wall_dist(new_head, w, h)  # daha uzak olan (daha büyük mesafe) daha NEGATİF => önce gelir
-            candidates.append((food_dist, -area, wall_score, d))
+            wall = min_wall_dist(new_head, w, h)
+            axis = 'v' if d in (UP, DOWN) else 'h'
+            same_dir_bonus = 0.0
+            if state.last_dir is not None and d == state.last_dir:
+                same_dir_bonus = -0.3  # küçük bonus (daha az ceza)
+            osc_pen = 0.0
+            if now < state.osc_until and state.osc_axis == axis:
+                osc_pen = 0.6  # aynı eksene ağır ceza
+            rev_pen = 0.0
+            if reverse_dir and d == reverse_dir:
+                rev_pen = 1.0  # ters yöne büyük ceza
+            # skor anahtarı: (food yakınlığı, -alan, duvardan uzaklığı ters, osilasyon/ters ceza, rasgele küçük jitter)
+            key = (food_dist, -area, -wall, osc_pen + rev_pen + same_dir_bonus, random.random()*0.02, d)
+            candidates.append(key)
 
-    # Osilasyon tespiti (ABAB)
-    oscillating = detect_oscillation(state)
-    # Reverse'ı mümkünse ele
-    if candidates and reverse_dir:
-        non_rev = [c for c in candidates if c[3] != reverse_dir]
-        if non_rev:
-            candidates = non_rev
-
+    # Corner-escape: köşe/duvara yapışıkken duvardan uzaklaştıranları seç
+    corner_mode = (min_wall_dist(head, w, h) <= 1)
     if candidates:
-        # Osilasyon halinde aynı eksendeki hareketlere küçük ceza
-        if oscillating and state.last_axis is not None:
-            scored = []
-            for food_d, neg_area, wall_s, d in candidates:
-                axis = 'v' if d in (UP, DOWN) else 'h'
-                osc_pen = 0.5 if axis == state.last_axis else 0.0
-                scored.append((food_d, neg_area, wall_s, osc_pen, random.random()*0.01, d))
-            scored.sort()
-            best = scored[0][-1]
-        else:
-            candidates.sort()
-            best = candidates[0][3]
+        if corner_mode:
+            better = [c for c in candidates if min_wall_dist((head[0]+c[-1][0], head[1]+c[-1][1]), w, h) > min_wall_dist(head, w, h)]
+            if better:
+                candidates = better
+        # reverse filtre (son çare değilse)
+        if reverse_dir:
+            non_rev = [c for c in candidates if c[-1] != reverse_dir]
+            if non_rev:
+                candidates = non_rev
+        candidates.sort()
+        best = candidates[0][-1]
         state.last_dir = best
         return best, False
 
-    # 4) Kuyruğa plan (dolaşma)
+    # Kuyruğa plan (dolaşma)
     path_to_tail = a_star(head, tail, blocked, w, h, ignore_tail_cell=tail, max_steps=MAX_ASTAR_STEPS)
     if path_to_tail:
+        first = path_to_tail[0]
         state.path = deque(path_to_tail)
         state.kind = 'tail'
-        first = path_to_tail[0]
         state.path.popleft()
         state.last_dir = first
         return first, False
 
-    # 5) Son çare — ilk geçerli hamle (reverse dahi olabilir)
+    # Son çare — ilk geçerli
     for d in DIRS:
         nx, ny = head[0] + d[0], head[1] + d[1]
         new_head = (nx, ny)
@@ -398,7 +395,7 @@ def main():
     info = pygame.display.Info()
     WIDTH, HEIGHT = info.current_w, info.current_h
     SCREEN = pygame.display.set_mode((WIDTH, HEIGHT), pygame.FULLSCREEN | pygame.HWSURFACE | pygame.DOUBLEBUF)
-    pygame.display.set_caption("Yılan Ekran Koruyucu — Akıllı v2")
+    pygame.display.set_caption("Yılan Ekran Koruyucu — Akıllı v3")
 
     BLOCK_SIZE = max(8, min(WIDTH, HEIGHT) // 40)
     SNAKE_WIDTH = int(BLOCK_SIZE * 0.8)
@@ -411,7 +408,7 @@ def main():
         draw_text(SCREEN, f"Tüm Zamanlar: {all_time_high} ({all_time_rate:.2f}/s)", 38, GREEN, WIDTH // 2, HEIGHT // 2)
         draw_text(SCREEN, f"Günlük: {daily_high} ({daily_rate:.2f}/s)", 38, GREEN, WIDTH // 2, HEIGHT // 2 + 48)
         pygame.display.flip()
-        time.sleep(1.0)
+        time.sleep(0.9)
 
     show_records()
 
@@ -428,6 +425,12 @@ def main():
         food = place_food(snake, snake_set, grid_w, grid_h)
         score = 0
         start_time = time.time()
+
+        # Dinamik food timeout (izlenebilirlik için uzun)
+        tps_est = 1.0 / max(MOVE_MIN_INTERVAL, MOVE_BASE_INTERVAL)
+        approx_cells = grid_w * grid_h
+        FOOD_TIMEOUT = int(min(150, max(60, approx_cells / (tps_est * 1.4))))
+
         food_timer_start = time.time()
 
         state = PlannerState()
@@ -437,6 +440,7 @@ def main():
         pygame.time.set_timer(MOVE_EVENT, int(move_interval * 1000))
 
         running = True
+        reason = "Bilinmiyor"
         while running:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -452,13 +456,16 @@ def main():
 
                     # Açlık
                     now = time.time()
-                    if now - food_timer_start > 30:
+                    if now - food_timer_start > FOOD_TIMEOUT:
                         running = False
                         reason = "Açlıktan Öldü"
                         break
 
-                    # Hamle seç
-                    d, using_food_plan = pick_move(snake, snake_set, food, grid_w, grid_h, state)
+                    # Osilasyon tespiti
+                    detect_oscillation(state, now)
+
+                    # Hamle
+                    d, using_food_plan = pick_move(snake, snake_set, food, grid_w, grid_h, state, now)
                     if d is None:
                         running = False
                         reason = "Hamle Yok"
@@ -498,7 +505,7 @@ def main():
 
             now = time.time()
             since_food = now - food_timer_start
-            if since_food > 20:
+            if since_food > (FOOD_TIMEOUT - 10):
                 pulse_alpha = int(128 + 127 * math.sin(now * 5))
                 draw_text(SCREEN, "Açlık Uyarısı", 40, YELLOW, WIDTH // 2, 60, alpha=pulse_alpha)
 
@@ -512,7 +519,7 @@ def main():
                     color = (0, green_value, 0)
                     pygame.draw.line(SCREEN, color, points[i], points[i + 1], SNAKE_WIDTH)
             for i, p in enumerate(points):
-                if i == 0 and since_food > 25:
+                if i == 0 and since_food > (FOOD_TIMEOUT - 5):
                     color = (int(255 * pulse), 0, 0)
                 else:
                     green_value = int(150 + 105 * max(0, (len(snake) - i)) / 10.0) if i >= len(snake) - 10 else int(255 * pulse)
@@ -545,7 +552,7 @@ def main():
         draw_text(SCREEN, "Oyun Bitti", 52, RED, WIDTH // 2, HEIGHT // 4)
         draw_text(SCREEN, f"Skor: {score} ({current_rate:.2f}/s) - {reason}", 38, WHITE, WIDTH // 2, HEIGHT // 2)
         pygame.display.flip()
-        time.sleep(1.2)
+        time.sleep(1.0)
 
         # Kayıt ekranı
         SCREEN.fill(BLACK)
@@ -553,7 +560,7 @@ def main():
         draw_text(SCREEN, f"Tüm Zamanlar: {all_time_high} ({all_time_rate:.2f}/s)", 38, GREEN, WIDTH // 2, HEIGHT // 2)
         draw_text(SCREEN, f"Günlük: {daily_high} ({daily_rate:.2f}/s)", 38, GREEN, WIDTH // 2, HEIGHT // 2 + 48)
         pygame.display.flip()
-        time.sleep(1.0)
+        time.sleep(0.9)
 
 if __name__ == "__main__":
     main()
